@@ -9,19 +9,13 @@ class MemoryOp(Enum):
 
 
 class MemRecord(object):
-    readCount = 0
-    writeCount = 0
-    count = 0
 
     def __init__(self, mem_op, address):
-        MemRecord.count += 1
         self.__address = int(address, 16)
         if mem_op == "r":
             self.__memOp = MemoryOp.READ
-            MemRecord.readCount += 1
         else:
             self.__memOp = MemoryOp.WRITE
-            MemRecord.writeCount += 1
 
     @property
     def address(self):
@@ -53,8 +47,43 @@ class CacheLine(object):
             + bin(self.tag)
         )
 
+    def swap(self, otherLine):
+        self.tag, otherLine.tag = otherLine.tag, self.tag
+        self.data, otherLine.data = otherLine.data, self.data
+        self.dirty, otherLine.dirty = otherLine.dirty, self.dirty
+        self.valid, otherLine.valid = otherLine.valid, self.valid
+
+    def memory_store(self):
+        assert(self.dirty and self.valid)
+        self.dirty = False
+
+    def memory_load(self, address, tag):
+        self.tag = tag
+        self.dirty = False
+        self.valid = True
+        self.data = None
+
+    def calc_address(self):
+        return None
 
 class Cache(object):
+    '''
+    @size: capacity of the cache
+    @blockSize: size of a cache line
+    @bitWidth: bit width of the address
+    @setAssoc: set associativity of the cache
+    @replacePolicy: only 'LRU' supported
+    @predictPolicy: 
+        None: no prediction
+        'MRU': most recently used cache line in a set
+        'MC': multi-column prediction method, which is a modification 
+              of a column associative cache. Note that when applying this
+              value, only write through policy produce the right statistic
+              number at this time. 
+    @writePolicy:
+        'through': write through policy. no cache for write
+        'back': cache write and refresh when eviction happens
+    '''
     def __init__(
         self,
         size="128KB",
@@ -82,13 +111,18 @@ class Cache(object):
         self._offsetWidth = int(math.log2(self._blockSize))
         self._indexWidth = int(math.log2(self._sets))
         self._tagWidth = int(bitWidth - self._offsetWidth - self._indexWidth)
+        # the memory where cachelines resides in
         self.__SRAM = [
             [CacheLine() for i in range(self._setAssoc)] for x in range(self._sets)
         ]
+        # for the implementation of LRU replacing policy and MRU prediction 
         self.__LRUQueue = [
             [i for i in range(self._setAssoc)] for x in range(self._sets)
         ]
         self.__currentAddress = None
+        self.__currentMemOp = None
+        # for the implementation of Multi-column prediction
+        self.__MCLocList = [[[ False for j in range(self._setAssoc)] for i in range(self._setAssoc)] for x in range(self._sets)]
         self.queryCount = 0
         self.rdQuery = 0
         self.wtQuery = 0
@@ -96,15 +130,15 @@ class Cache(object):
         self.wtHit = 0
         self.rdMiss = 0
         self.wtMiss = 0
+        self.firstHit = 0
+        self.nonFirstHit = 0
 
     def __memory_store(self, address=None, data=None):
         if address == None:
             address = self.__currentAddress
-
     def __memory_load(self, address=None):
         if address == None:
             address = self.__currentAddress
-        return None
 
     def _valid_list(self, setID):
         return [line.valid for line in self.__SRAM[setID]]
@@ -115,22 +149,20 @@ class Cache(object):
     def _is_full(self, setID):
         return self._valid_list(setID).count(True) == self._setAssoc
 
-    # Returns the way where the data stored
     def _index_tag(self, setID, tag):
+        ''' Returns the way where the data stored '''
         return self._tag_list(setID).index(tag)
 
-    ############# implement replace policy #################
     def _replace_decide(self, setID):
+        '''
+        implement replace policy
+        '''
         way = 0
         if self._replacePolicy == "LRU":
             if self._is_full(setID):
-                way = self.__LRUQueue[setID].pop(0)
-                self.__LRUQueue[setID].append(way)
+                way = self.__LRUQueue[setID][0]
             else:
                 way = self._valid_list(setID).index(False)
-                q = self.__LRUQueue[setID]
-                q.remove(way)
-                q.append(way)
         else:
             raise NotImplementedError
         return way
@@ -140,10 +172,24 @@ class Cache(object):
         lruQ.remove(way)
         lruQ.append(way)
 
+    # multi-column swap
+    def _mc_swap(self, setID, majorWay, way):
+        majorLine = self.__SRAM[setID][majorWay]
+        toLine = self.__SRAM[setID][way]
+        majorLine.swap(toLine)
+        for mcList in self.__MCLocList[setID]:
+            mcList[majorWay], mcList[way] = mcList[way], mcList[majorWay]
+        # update LRU queue
+        lruQ = self.__LRUQueue[setID]
+        id1 = lruQ.index(way)
+        id2 = lruQ.index(majorWay)
+        lruQ[id1], lruQ[id2] = lruQ[id2], lruQ[id1]
+
     def _cache_data(self, setID, tag, data, makeDirty=False):
         cacheSet = self.__SRAM[setID]
         # Merge, comes from write hit or write after read
         if tag in self._tag_list(setID):
+            assert(self.__currentMemOp == MemoryOp.WRITE)
             line = cacheSet[self._index_tag(setID, tag)]
             line.data = data
             if makeDirty:
@@ -151,36 +197,105 @@ class Cache(object):
             line.valid = True
         # Comes from read cache or write cache
         else:
-            way = self._replace_decide(setID)
-            line = cacheSet[way]
-            # conflict, cache flush
-            if line.dirty:
-                self.__memory_store(self.__currentAddress, line.data)
-            line.data = data
-            line.tag = tag
-            line.valid = True
-            if makeDirty:
-                line.dirty = True
+            if self._predictPolicy == 'MC': 
+                majorWay = tag % self._setAssoc
+                line = cacheSet[majorWay]
+                # find a place to cache data, no matter it is empty or not
+                way = self._replace_decide(setID)
+                if cacheSet[way].dirty and cacheSet[way].valid:
+                    cacheSet[way].memory_store()
+                self._mc_swap(setID, majorWay, way)
+                # cache new line
+                line.data = data
+                line.tag = tag
+                line.valid = True
+                if makeDirty:
+                    line.dirty = True
+                # update multi-column index                    
+                mcList = self.__MCLocList[setID]
+                for i in range(self._setAssoc):
+                    if (i == majorWay):
+                        mcList[i][majorWay] = True
+                    else:
+                        mcList[i][majorWay] = False
+                self._replace_update(setID, majorWay)
+
+            else:
+                way = self._replace_decide(setID)
+                self._replace_update(setID, way)
+                line = cacheSet[way]
+                # conflict, cache flush
+                if line.dirty:
+                    line.memory_store()
+                line.data = data
+                line.tag = tag
+                line.valid = True
+                if makeDirty:
+                    line.dirty = True
 
     def _read_data(self, setID, tag, refresh=True):
         cacheSet = self.__SRAM[setID]
-        # read hit
-        if tag in self._tag_list(setID):
-            way = self._index_tag(setID, tag)
-            if refresh:
-                self._replace_update(setID, way)
-            return ("Hit", cacheSet[way].data)
-        # read miss
-        else:
-            return ("Miss", None)
+        # MRU way predict policy (support write through policy only)
+        if self._predictPolicy == 'MRU':
+            way = self.__LRUQueue[setID][-1]
+            if tag == cacheSet[way].tag:
+                self.firstHit += 1
+                return ("Hit", cacheSet[way].data)
+            elif tag in self._tag_list(setID):
+                self.nonFirstHit += 1
+                way = self._index_tag(setID, tag)
+                if refresh:
+                    self._replace_update(setID, way)
+                return ("Hit", cacheSet[way].data)
+            else:
+                return ("Miss", None)
+        # Multi-Column way predict policy
+        # The difference between PMC and SMC(Sequential Multi-column) is the
+        # latency and area of cache in a chip, which has no relation to this 
+        # cache behavior simulator. As a matter of fact, PMC and SMC induce the 
+        # same miss rate.
+        elif self._predictPolicy == 'MC':
+            majorWay = tag % self._setAssoc
+            logging.debug('majorWay: %d' % majorWay)
+            if tag == cacheSet[majorWay].tag:
+                self.firstHit += 1
+                return ("Hit", cacheSet[majorWay].data)
+            else:
+                selectedLocIndex = self.__MCLocList[setID][majorWay]
+                for way in range(self._setAssoc):
+                    if not selectedLocIndex[way]: 
+                        continue
+                    if tag == cacheSet[way].tag:
+                        self.nonFirstHit += 1
+                        self._mc_swap(setID, majorWay, way)
+                        if refresh:
+                            self._replace_update(setID, majorWay)
+                        return ("Hit", cacheSet[majorWay].data)
+                return ("Miss", None)
+
+        else: # No predict policy
+            # read hit
+            if tag in self._tag_list(setID):
+                way = self._index_tag(setID, tag)
+                if refresh:
+                    self._replace_update(setID, way)
+                return ("Hit", cacheSet[way].data)
+            # read miss
+            else:
+                return ("Miss", None)
 
     def query(self, record):
         self.queryCount += 1
         self.__currentAddress = record.address
+        self.__currentMemOp = record.memOp
         data = None
         setID = (record.address >> self._offsetWidth) % self._sets
         tag = record.address >> (self._bitWidth - self._tagWidth)
         memOp = record.memOp
+
+#        self.print_LRUQueue(setID)
+#        self.print_MCList(setID)
+#        self.print_cache(setID)
 
         if memOp == MemoryOp.READ:
             self.rdQuery += 1
@@ -192,7 +307,7 @@ class Cache(object):
                 self._cache_data(setID, tag, data)
             else:
                 self.rdHit += 1
-                logging.info("Read Hit at {:b}".format(self.__currentAddress))
+                logging.info("Read Hit  at {:b}".format(self.__currentAddress))
 
         elif memOp == MemoryOp.WRITE:
             self.wtQuery += 1
@@ -213,6 +328,16 @@ class Cache(object):
         else:
             raise NotImplementedError
 
+    def print_LRUQueue(self, setID):
+        print(self.__LRUQueue[setID])
+
+    def print_MCList(self, setID):
+        print(self.__MCLocList[setID])
+
+    def print_cache(self, setID):
+        for line in self.__SRAM[setID]:
+            print(line)
+
     def print_config(self):
         print(
             "size: %dKB, offset: %db, index: %db, tag: %db"
@@ -229,7 +354,7 @@ class Cache(object):
         else:
             wtMissRatio = self.wtMiss / self.wtQuery
         print(
-            "Total Read:%d, Total Write:%d, ReadMiss:%d, WriteMiss:%d, Read Miss Rate:%f, Write Miss Rate:%f"
+            "TotalRead:%d, TotalWrite:%d, ReadMiss:%d, WriteMiss:%d, Read Miss Rate:%f, Write Miss Rate:%f, First Hit Rate:%f, Non-first Hit Rate:%f, First Hit Rate(aginst hit):%f"
             % (
                 self.rdQuery,
                 self.wtQuery,
@@ -237,15 +362,18 @@ class Cache(object):
                 self.wtMiss,
                 rdMissRatio,
                 wtMissRatio,
+                self.firstHit / self.rdQuery,
+                self.nonFirstHit / self.rdQuery,
+                self.firstHit / self.rdHit
             )
         )
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.WARNING)
-    c = Cache(size="128kB", setAssoc=4, writePolicy="back", blockSize="8B")
+    c = Cache(size="128kB", setAssoc=4, writePolicy="through", blockSize="8B", predictPolicy='MC')
     c.print_config()
-    with open("./traces/perlbench.trace", "r") as trace:
+    with open("./traces/astar.trace", "r") as trace:
         for line in trace.readlines():
             line = line.strip().split()
             c.query(MemRecord(line[0], line[1]))
